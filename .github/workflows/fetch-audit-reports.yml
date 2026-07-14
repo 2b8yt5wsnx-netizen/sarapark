@@ -1,0 +1,201 @@
+name: Temporary audit report fetch
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 selenium
+      - name: Fetch official reports
+        run: |
+          cat > /tmp/fetch_reports.py <<'PY'
+          import json, os, re, time, zipfile, traceback
+          from pathlib import Path
+          from urllib.parse import urljoin, quote_from_bytes
+          import requests
+          from bs4 import BeautifulSoup
+          from selenium import webdriver
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+
+          OUT = Path('out').resolve(); OUT.mkdir(exist_ok=True)
+          LOG=[]
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36'
+          S=requests.Session(); S.headers.update({'User-Agent':UA,'Accept-Language':'ko-KR,ko;q=0.9,en;q=0.8'})
+          def log(*x):
+              s=' '.join(map(str,x)); print(s, flush=True); LOG.append(s)
+          def save_resp(name,r):
+              p=OUT/name; p.write_bytes(r.content); log(name, r.status_code, r.url, len(r.content), r.headers.get('content-type'), r.headers.get('content-disposition'))
+              return p
+          def is_pdf(p):
+              try:return p.read_bytes()[:5]==b'%PDF-'
+              except:return False
+          def fetch(url,name,referer=None):
+              h={'Referer':referer} if referer else {}
+              r=S.get(url,headers=h,timeout=60,allow_redirects=True)
+              return save_resp(name,r)
+
+          # 1. Chungbuk Technopark
+          try:
+              page='https://www.cbtp.or.kr/index.php?board_id=board_106080502&categ=&control=bbs&list_mode=&lm_uid=366&mode=view&no=16&nohead=y&offset=1&page=1'
+              r=S.get(page,timeout=60); save_resp('cbtp_page.html',r)
+              soup=BeautifulSoup(r.content,'html.parser')
+              links=[]
+              for a in soup.find_all('a'):
+                  href=a.get('href') or ''
+                  if 'action=down' in href or '.pdf' in href.lower(): links.append(urljoin(page,href))
+              known_name='2025감사보고서_충북TP.pdf'
+              cp949=quote_from_bytes(known_name.encode('cp949'))
+              links += [f'https://www.cbtp.or.kr/index.php?action=down&board_id=board_106080502&control=util&dtype=up&fenc=r&file={cp949}&no=16&task=down&where=dat']
+              log('CBTP links',links)
+              for i,u in enumerate(dict.fromkeys(links)):
+                  try:
+                      p=fetch(u,f'cbtp_candidate_{i}.bin',page)
+                      if is_pdf(p): p.rename(OUT/'충북테크노파크_2025년도_감사보고서.pdf'); break
+                  except Exception as e: log('CBTP candidate error',repr(e))
+          except Exception: log('CBTP fatal',traceback.format_exc())
+
+          # Browser setup
+          dldir=str(OUT)
+          opts=Options(); opts.add_argument('--headless=new'); opts.add_argument('--no-sandbox'); opts.add_argument('--disable-dev-shm-usage'); opts.add_argument('--window-size=1600,1200'); opts.add_argument(f'--user-agent={UA}')
+          opts.set_capability('goog:loggingPrefs', {'performance':'ALL','browser':'ALL'})
+          opts.add_experimental_option('prefs', {'download.default_directory':dldir,'download.prompt_for_download':False,'plugins.always_open_pdf_externally':True,'safebrowsing.enabled':True})
+          driver=webdriver.Chrome(options=opts); wait=WebDriverWait(driver,30)
+          try:
+              # 2. National Heritage Promotion Agency / ALIO
+              try:
+                  url='https://www.alio.go.kr/mobile/organ/quarterlyReport.do?apbaId=C0191&nowQuarter=0'
+                  driver.get(url); time.sleep(7)
+                  (OUT/'alio_rendered.html').write_text(driver.page_source,encoding='utf-8')
+                  try:
+                      data=driver.execute_script("return (typeof app!=='undefined' && app.$data) ? JSON.parse(JSON.stringify(app.$data)) : null")
+                      (OUT/'alio_app_data.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+                      log('ALIO app data keys', list(data.keys()) if isinstance(data,dict) else type(data))
+                  except Exception as e: log('ALIO app data error',repr(e))
+                  els=driver.find_elements(By.XPATH,"//*[contains(normalize-space(.),'외부회계감사보고서')]")
+                  log('ALIO matching elements',len(els),[(e.tag_name,e.text[:100]) for e in els[-10:]])
+                  clicked=False
+                  for e in reversed(els):
+                      try:
+                          if e.is_displayed() and e.size['height']<150:
+                              driver.execute_script('arguments[0].scrollIntoView({block:"center"});',e); driver.execute_script('arguments[0].click();',e); clicked=True; log('ALIO clicked',e.tag_name,e.text); break
+                      except Exception as ex: log('ALIO click err',repr(ex))
+                  time.sleep(6)
+                  (OUT/'alio_after_click.html').write_text(driver.page_source,encoding='utf-8')
+                  # click download controls
+                  controls=driver.find_elements(By.XPATH,"//*[contains(normalize-space(.),'다운로드') or contains(normalize-space(.),'PDF')]")
+                  log('ALIO download controls',len(controls),[(e.tag_name,e.text[:80],e.get_attribute('href')) for e in controls[-20:]])
+                  for e in controls:
+                      try:
+                          if e.is_displayed() and e.size['height']<120:
+                              driver.execute_script('arguments[0].click();',e); time.sleep(4)
+                      except Exception as ex: log('ALIO download click err',repr(ex))
+                  # Network URLs
+                  perf=driver.get_log('performance')
+                  urls=[]
+                  for item in perf:
+                      try:
+                          m=json.loads(item['message'])['message']
+                          if m['method']=='Network.responseReceived':
+                              u=m['params']['response']['url']; ct=m['params']['response'].get('mimeType','')
+                              if any(k in u.lower() for k in ['download','file.json','.pdf','reportfiles']): urls.append((u,ct))
+                      except: pass
+                  (OUT/'alio_network.json').write_text(json.dumps(urls,ensure_ascii=False,indent=2),encoding='utf-8')
+                  log('ALIO network candidates',urls[-30:])
+                  # Requests fallback from app data
+                  if isinstance(data,dict):
+                      text=json.dumps(data,ensure_ascii=False)
+                      disclosures=re.findall(r'20\d{14,}',text)
+                      log('ALIO disclosure candidates',disclosures[:30])
+                      for disc in dict.fromkeys(disclosures):
+                          try:
+                              rr=S.get('https://www.alio.go.kr/item/itemReportFiles.json',params={'disclosureNo':disc},timeout=30)
+                              if '외부회계' in text or rr.ok:
+                                  (OUT/f'alio_files_{disc}.json').write_bytes(rr.content)
+                              js=rr.json(); rows=js.get('data') or []
+                              for row in rows:
+                                  if str(row.get('reportFormNo'))=='32301' or '감사' in row.get('orcpFileNa',''):
+                                      u='https://www.alio.go.kr/download/file.json?f={}&d={}&s={}'.format(row.get('fileNo'),row.get('disclosureNo') or disc,row.get('submissionNo'))
+                                      p=fetch(u,'alio_candidate_'+str(row.get('fileNo'))+'.bin',url)
+                                      if is_pdf(p): p.rename(OUT/'국가유산진흥원_외부회계감사보고서.pdf')
+                          except Exception as ex: pass
+              except Exception: log('ALIO fatal',traceback.format_exc())
+
+              # 3. ETRI / ONE ST
+              try:
+                  url='https://onest.re.kr/mgp/open/lst/moveMngmPblntList.do?pstinstCode=ETRI'
+                  driver.get(url); time.sleep(6)
+                  (OUT/'etri_list_rendered.html').write_text(driver.page_source,encoding='utf-8')
+                  rows=driver.find_elements(By.XPATH,"//*[self::tr or self::li][contains(normalize-space(.),'회계감사보고서')]")
+                  log('ETRI rows',len(rows),[(r.tag_name,r.text[:200]) for r in rows])
+                  for row in rows:
+                      try:
+                          controls=row.find_elements(By.XPATH,".//*[self::a or self::button or @onclick]")
+                          log('ETRI row controls',[(c.tag_name,c.text,c.get_attribute('href'),c.get_attribute('onclick')) for c in controls])
+                          target=next((c for c in controls if '보기' in c.text or c.get_attribute('onclick')),controls[-1] if controls else row)
+                          driver.execute_script('arguments[0].click();',target); break
+                      except Exception as ex: log('ETRI click err',repr(ex))
+                  time.sleep(6)
+                  (OUT/'etri_detail_rendered.html').write_text(driver.page_source,encoding='utf-8')
+                  controls=driver.find_elements(By.XPATH,"//*[self::a or self::button][contains(normalize-space(.),'다운로드') or contains(translate(@href,'PDF','pdf'),'.pdf') or contains(normalize-space(.),'첨부')]")
+                  log('ETRI detail controls',len(controls),[(c.tag_name,c.text,c.get_attribute('href'),c.get_attribute('onclick')) for c in controls])
+                  for c in controls:
+                      try:
+                          if c.is_displayed(): driver.execute_script('arguments[0].click();',c); time.sleep(4)
+                      except Exception as ex: log('ETRI download click err',repr(ex))
+                  perf=driver.get_log('performance'); urls=[]
+                  for item in perf:
+                      try:
+                          m=json.loads(item['message'])['message']
+                          if m['method']=='Network.responseReceived':
+                              u=m['params']['response']['url']; ct=m['params']['response'].get('mimeType','')
+                              if any(k in u.lower() for k in ['download','file','.pdf','attach']): urls.append((u,ct))
+                      except: pass
+                  (OUT/'etri_network.json').write_text(json.dumps(urls,ensure_ascii=False,indent=2),encoding='utf-8')
+                  log('ETRI network candidates',urls[-50:])
+                  # Try requests against candidate URLs with browser cookies
+                  for cookie in driver.get_cookies(): S.cookies.set(cookie['name'],cookie['value'],domain=cookie.get('domain'))
+                  for i,(u,ct) in enumerate(dict.fromkeys(urls)):
+                      try:
+                          p=fetch(u,f'etri_candidate_{i}.bin',driver.current_url)
+                          if is_pdf(p): p.rename(OUT/'한국전자통신연구원_회계감사보고서.pdf'); break
+                      except Exception as ex: log('ETRI candidate error',repr(ex))
+              except Exception: log('ETRI fatal',traceback.format_exc())
+          finally:
+              try: driver.quit()
+              except: pass
+
+          # Normalize downloaded PDFs and write manifest
+          for p in list(OUT.iterdir()):
+              if p.suffix.lower() in ['.crdownload','.tmp']: log('partial download',p.name,p.stat().st_size)
+          manifest=[]
+          for p in OUT.iterdir():
+              manifest.append({'name':p.name,'size':p.stat().st_size,'pdf_magic':is_pdf(p)})
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'run.log').write_text('\n'.join(LOG),encoding='utf-8')
+          with zipfile.ZipFile('audit_reports_bundle.zip','w',zipfile.ZIP_DEFLATED) as z:
+              for p in OUT.iterdir(): z.write(p,p.name)
+          PY
+          python /tmp/fetch_reports.py
+      - name: Upload files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-reports
+          path: |
+            out/
+            audit_reports_bundle.zip
+          if-no-files-found: warn
+          retention-days: 1
