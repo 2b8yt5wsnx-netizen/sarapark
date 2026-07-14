@@ -1,0 +1,31 @@
+name: Fetch public audit reports
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 selenium
+      - name: Fetch and verify reports
+        run: python scripts/fetch_audit_reports.py
+      - name: Upload reports and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-reports-20260714
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
